@@ -44,7 +44,9 @@
 #include "UIKit/UIApplication.h"
 #endif
 
-typedef enum
+NS_ASSUME_NONNULL_BEGIN
+
+typedef NS_OPTIONS(NSInteger, STKAudioPlayerState)
 {
     STKAudioPlayerStateReady,
     STKAudioPlayerStateRunning = 1,
@@ -54,10 +56,9 @@ typedef enum
     STKAudioPlayerStateStopped = (1 << 4),
     STKAudioPlayerStateError = (1 << 5),
     STKAudioPlayerStateDisposed = (1 << 6)
-}
-STKAudioPlayerState;
+};
 
-typedef enum
+typedef NS_ENUM(NSInteger, STKAudioPlayerStopReason)
 {
 	STKAudioPlayerStopReasonNone = 0,
 	STKAudioPlayerStopReasonEof,
@@ -65,10 +66,9 @@ typedef enum
 	STKAudioPlayerStopReasonPendingNext,
 	STKAudioPlayerStopReasonDisposed,
 	STKAudioPlayerStopReasonError = 0xffff
-}
-STKAudioPlayerStopReason;
+};
 
-typedef enum
+typedef NS_ENUM(NSInteger, STKAudioPlayerErrorCode)
 {
 	STKAudioPlayerErrorNone = 0,
 	STKAudioPlayerErrorDataSource,
@@ -77,9 +77,13 @@ typedef enum
     STKAudioPlayerErrorCodecError,
     STKAudioPlayerErrorDataNotFound,
     STKAudioPlayerErrorOther = 0xffff
-}
-STKAudioPlayerErrorCode;
+};
 
+///
+/// Options to initiailise the Audioplayer with.
+/// By default if you set buffer size or seconds to 0, the non-zero default will be used
+/// If you would like to disable the buffer option completely set to STK_DISABLE_BUFFER
+///
 typedef struct
 {
     /// If YES then seeking a track will cause all pending items to be flushed from the queue
@@ -91,7 +95,7 @@ typedef struct
 	/// The size of the internal I/O read buffer. This data in this buffer is transient and does not need to be larger.
     UInt32 readBufferSize;
     /// The size of the decompressed buffer (Default is 10 seconds which uses about 1.7MB of RAM)
-    UInt32 bufferSizeInSeconds;
+    float bufferSizeInSeconds;
     /// Number of seconds of decompressed audio is required before playback first starts for each item (Default is 0.5 seconds. Must be larger than bufferSizeInSeconds)
     Float32 secondsRequiredToStartPlaying;
 	/// Seconds after a seek is performed before data needs to come in (after which the state will change to playing/buffering)
@@ -101,7 +105,9 @@ typedef struct
 }
 STKAudioPlayerOptions;
 
-typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames);
+#define STK_DISABLE_BUFFER (0xffffffff)
+
+typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, float* frames);
 
 @interface STKFrameFilterEntry : NSObject
 @property (readonly) NSString* name;
@@ -129,6 +135,8 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 /// Raised when items queued items are cleared (usually because of a call to play, setDataSource or stop)
 -(void) audioPlayer:(STKAudioPlayer*)audioPlayer didCancelQueuedItems:(NSArray*)queuedItems;
 
+-(void) plotGraphWithBuffer:(float*)buffer andLength:(UInt32)count;
+
 @end
 
 @interface STKAudioPlayer : NSObject<STKDataSourceDelegate>
@@ -147,13 +155,13 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 /// Enables or disables the EQ
 @property (readwrite) BOOL equalizerEnabled;
 /// Returns an array of STKFrameFilterEntry objects representing the filters currently in use
-@property (readonly) NSArray* frameFilters;
+@property (readonly, nullable) NSArray* frameFilters;
 /// Returns the items pending to be played (includes buffering and upcoming items but does not include the current item)
 @property (readonly) NSArray* pendingQueue;
 /// The number of items pending to be played (includes buffering and upcoming items but does not include the current item)
 @property (readonly) NSUInteger pendingQueueCount;
 /// Gets the most recently queued item that is still pending to play
-@property (readonly) NSObject* mostRecentlyQueuedStillPendingItem;
+@property (readonly, nullable) NSObject* mostRecentlyQueuedStillPendingItem;
 /// Gets the current state of the player
 @property (readwrite) STKAudioPlayerState state;
 /// Gets the options provided to the player on startup
@@ -170,10 +178,10 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 +(STKDataSource*) dataSourceFromURL:(NSURL*)url;
 
 /// Initializes a new STKAudioPlayer with the default options
--(id) init;
+-(instancetype) init;
 
 /// Initializes a new STKAudioPlayer with the given options
--(id) initWithOptions:(STKAudioPlayerOptions)optionsIn;
+-(instancetype) initWithOptions:(STKAudioPlayerOptions)optionsIn;
 
 /// Plays an item from the given URL string (all pending queued items are removed).
 /// The NSString is used as the queue item ID
@@ -250,17 +258,19 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 
 /// Appends a frame filter with the given name and filter block just after the filter with the given name.
 /// If the given name is nil, the filter will be inserted at the beginning of the filter change
--(void) addFrameFilterWithName:(NSString*)name afterFilterWithName:(NSString*)afterFilterWithName block:(STKFrameFilter)block;
+-(void) addFrameFilterWithName:(NSString*)name afterFilterWithName:(nullable NSString*)afterFilterWithName block:(STKFrameFilter)block;
 
 /// Reads the peak power in decibals for the given channel (0 or 1).
 /// Return values are between -60 (low) and 0 (high).
--(float) peakPowerInDecibelsForChannel:(NSUInteger)channelNumber;
+//-(float) peakPowerInDecibelsForChannel:(NSUInteger)channelNumber;
 
 /// Reads the average power in decibals for the given channel (0 or 1)
 /// Return values are between -60 (low) and 0 (high).
--(float) averagePowerInDecibelsForChannel:(NSUInteger)channelNumber;
+//-(float) averagePowerInDecibelsForChannel:(NSUInteger)channelNumber;
 
 /// Sets the gain value (from -96 low to +24 high) for an equalizer band (0 based index)
 -(void) setGain:(float)gain forEqualizerBand:(int)bandIndex;
 
 @end
+
+NS_ASSUME_NONNULL_END

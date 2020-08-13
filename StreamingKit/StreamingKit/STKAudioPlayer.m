@@ -41,6 +41,7 @@
 #import "NSMutableArray+STKAudioPlayer.h"
 #import "libkern/OSAtomic.h"
 #import <float.h>
+#import "STKFloatConverter.h"
 
 #ifndef DBL_MAX
 #define DBL_MAX 1.7976931348623157e+308
@@ -51,20 +52,20 @@
 #define kOutputBus 0
 #define kInputBus 1
 
-#define STK_DBMIN (-60)
-#define STK_DBOFFSET (-74.0)
+//#define STK_DBMIN (-60)
+//#define STK_DBOFFSET (-74.0)
 #define STK_LOWPASSFILTERTIMESLICE (0.0005)
 
-#define STK_DEFAULT_PCM_BUFFER_SIZE_IN_SECONDS (2 * 60)
+#define STK_DEFAULT_PCM_BUFFER_SIZE_IN_SECONDS (0.1)
 #define STK_DEFAULT_SECONDS_REQUIRED_TO_START_PLAYING (1)
 #define STK_DEFAULT_SECONDS_REQUIRED_TO_START_PLAYING_AFTER_BUFFER_UNDERRUN (7.5)
 #define STK_MAX_COMPRESSED_PACKETS_FOR_BITRATE_CALCULATION (4096)
-#define STK_DEFAULT_READ_BUFFER_SIZE (64 * 1024)
+#define STK_DEFAULT_READ_BUFFER_SIZE (128 * 1024)
 #define STK_DEFAULT_PACKET_BUFFER_SIZE (2048)
 #define STK_DEFAULT_GRACE_PERIOD_AFTER_SEEK_SECONDS (0.5)
 
 #define OSSTATUS_PRINTF_PLACEHOLDER @"%c%c%c%c"
-#define OSSTATUS_PRINTF_VALUE(status) ((status) >> 24) & 0xFF, ((status) >> 16) & 0xFF, ((status) >> 8) & 0xFF, (status) & 0xFF
+#define OSSTATUS_PRINTF_VALUE(status) (char)(((status) >> 24) & 0xFF), (char)(((status) >> 16) & 0xFF), (char)(((status) >> 8) & 0xFF), (char)((status) & 0xFF)
 
 #define LOGINFO(x) [self logInfo:[NSString stringWithFormat:@"%s %@", sel_getName(_cmd), x]];
 
@@ -93,6 +94,34 @@ static void PopulateOptionsWithDefault(STKAudioPlayerOptions* options)
 	if (options->gracePeriodAfterSeekInSeconds == 0)
     {
         options->gracePeriodAfterSeekInSeconds = MIN(STK_DEFAULT_GRACE_PERIOD_AFTER_SEEK_SECONDS, options->bufferSizeInSeconds);
+    }
+}
+
+static void NormalizeDisabledBuffers(STKAudioPlayerOptions* options)
+{
+    if (options->bufferSizeInSeconds == STK_DISABLE_BUFFER)
+    {
+        options->bufferSizeInSeconds = 0;
+    }
+    
+    if (options->readBufferSize == STK_DISABLE_BUFFER)
+    {
+        options->readBufferSize = 0;
+    }
+    
+    if (options->secondsRequiredToStartPlaying == STK_DISABLE_BUFFER)
+    {
+        options->secondsRequiredToStartPlaying = 0;
+    }
+    
+    if (options->secondsRequiredToStartPlayingAfterBufferUnderun == STK_DISABLE_BUFFER)
+    {
+        options->secondsRequiredToStartPlayingAfterBufferUnderun = 0;
+    }
+    
+    if (options->gracePeriodAfterSeekInSeconds == STK_DISABLE_BUFFER)
+    {
+        options->gracePeriodAfterSeekInSeconds = 0;
     }
 }
 
@@ -145,7 +174,7 @@ STKAudioPlayerInternalState;
 @end
 
 @implementation STKFrameFilterEntry
--(id) initWithFilter:(STKFrameFilter)filterIn andName:(NSString*)nameIn
+-(instancetype) initWithFilter:(STKFrameFilter)filterIn andName:(NSString*)nameIn
 {
 	if (self = [super init])
 	{
@@ -271,6 +300,9 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     volatile BOOL disposeWasRequested;
     volatile BOOL seekToTimeWasRequested;
     volatile STKAudioPlayerStopReason stopReason;
+    
+    float **_floatBuffers;
+    STKFloatConverter *_floatConverter;
 }
 
 @property (readwrite) STKAudioPlayerInternalState internalState;
@@ -476,12 +508,12 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
 }
 
--(id) init
+-(instancetype) init
 {
     return [self initWithOptions:(STKAudioPlayerOptions){}];
 }
 
--(id) initWithOptions:(STKAudioPlayerOptions)optionsIn
+-(instancetype) initWithOptions:(STKAudioPlayerOptions)optionsIn
 {
     if (self = [super init])
     {
@@ -491,6 +523,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         self->equalizerEnabled = optionsIn.equalizerBandFrequencies[0] != 0;
 
         PopulateOptionsWithDefault(&options);
+        NormalizeDisabledBuffers(&options);
         
         framesRequiredToStartPlaying = canonicalAudioStreamBasicDescription.mSampleRate * options.secondsRequiredToStartPlaying;
         framesRequiredToPlayAfterRebuffering = canonicalAudioStreamBasicDescription.mSampleRate * options.secondsRequiredToStartPlayingAfterBufferUnderun;
@@ -526,7 +559,21 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         
         upcomingQueue = [[NSMutableArray alloc] init];
         bufferingQueue = [[NSMutableArray alloc] init];
+        
+        
+        //initialie the float converter
+        // Allocate the float buffers
+        _floatConverter = [[STKFloatConverter alloc] initWithSourceFormat:canonicalAudioStreamBasicDescription];
+        size_t sizeToAllocate = sizeof(float*) * canonicalAudioStreamBasicDescription.mChannelsPerFrame;
+        sizeToAllocate = MAX(8, sizeToAllocate);
+        _floatBuffers   = (float**)malloc( sizeToAllocate );
+        UInt32 outputBufferSize = 32 * 1024; // 32 KB
+        for ( int i=0; i< canonicalAudioStreamBasicDescription.mChannelsPerFrame; i++ ) {
+            _floatBuffers[i] = (float*)malloc(outputBufferSize);
+        }
 
+
+        
 		[self resetPcmBuffers];
         [self createAudioGraph];
         [self createPlaybackThread];
@@ -878,7 +925,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         }
 		case kAudioFileStreamProperty_ReadyToProducePackets:
         {
-			if (!audioConverterAudioStreamBasicDescription.mFormatID == kAudioFormatLinearPCM)
+			if (audioConverterAudioStreamBasicDescription.mFormatID != kAudioFormatLinearPCM)
 			{
 				discontinuous = YES;
 			}
@@ -1716,10 +1763,10 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     
     self->pcmBufferFrameStartIndex = 0;
     self->pcmBufferUsedFrameCount = 0;
-	self->peakPowerDb[0] = STK_DBMIN;
-	self->peakPowerDb[1] = STK_DBMIN;
-	self->averagePowerDb[0] = STK_DBMIN;
-	self->averagePowerDb[1] = STK_DBMIN;
+//	self->peakPowerDb[0] = STK_DBMIN;
+//	self->peakPowerDb[1] = STK_DBMIN;
+//	self->averagePowerDb[0] = STK_DBMIN;
+//	self->averagePowerDb[1] = STK_DBMIN;
     
     OSSpinLockUnlock(&pcmBufferSpinLock);
 }
@@ -1948,10 +1995,8 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 
     [self destroyAudioConverter];
     
-    //This breaks mono files
-    //canonicalAudioStreamBasicDescription.mChannelsPerFrame = asbd->mChannelsPerFrame;
-    
     BOOL isRecording = currentlyReadingEntry.dataSource.recordToFileUrl != nil;
+    
     if (isRecording)
     {
         recordAudioStreamBasicDescription = (AudioStreamBasicDescription)
@@ -2414,6 +2459,9 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     }
     else if (!isRunning)
     {
+        stopReason = stopReasonIn;
+        self.internalState = STKAudioPlayerInternalStateStopped;
+
         return;
     }
     
@@ -3207,60 +3255,66 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 	}
 	else
 	{
-		[self appendFrameFilterWithName:@"STKMeteringFilter" block:^(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames)
+		[self appendFrameFilterWithName:@"STKMeteringFilter" block:^(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, float* frames)
 		{
-			SInt16* samples16 = (SInt16*)frames;
-			SInt32* samples32 = (SInt32*)frames;
-			UInt32 countLeft = 0;
-			UInt32 countRight = 0;
-			Float32 decibelsLeft = STK_DBMIN;
-			Float32 peakValueLeft = STK_DBMIN;
-			Float64 totalValueLeft = 0;
-			Float32 previousFilteredValueOfSampleAmplitudeLeft = 0;
-			Float32 decibelsRight = STK_DBMIN;
-			Float32 peakValueRight = STK_DBMIN;
-			Float64 totalValueRight = 0;
-			Float32 previousFilteredValueOfSampleAmplitudeRight = 0;
-			
-			if (bytesPerFrame / channelsPerFrame == 2)
-			{
-				for (int i = 0; i < frameCount * channelsPerFrame; i += channelsPerFrame)
-				{
-					Float32 absoluteValueOfSampleAmplitudeLeft = abs(samples16[i]);
-					Float32 absoluteValueOfSampleAmplitudeRight = abs(samples16[i + 1]);
-					
-					CALCULATE_METER(Left);
-					CALCULATE_METER(Right);
-				}
-			}
-			else if (bytesPerFrame / channelsPerFrame == 4)
-			{
-				for (int i = 0; i < frameCount * channelsPerFrame; i += channelsPerFrame)
-				{
-					Float32 absoluteValueOfSampleAmplitudeLeft = abs(samples32[i]) / 32768.0;
-					Float32 absoluteValueOfSampleAmplitudeRight = abs(samples32[i + 1]) / 32768.0;
-					
-					CALCULATE_METER(Left);
-					CALCULATE_METER(Right);
-				}
-			}
-			else
-			{
-				return;
-			}
-			
-			peakPowerDb[0] = MIN(MAX(decibelsLeft, -60), 0);
-			peakPowerDb[1] = MIN(MAX(decibelsRight, -60), 0);
-			
-			if (countLeft > 0)
-			{
-				averagePowerDb[0] = MIN(MAX(totalValueLeft / frameCount, -60), 0);
-			}
-			
-			if (countRight != 0)
-			{
-				averagePowerDb[1] = MIN(MAX(totalValueRight / frameCount, -60), 0);
-			}
+            STKFloatConverterToFloat(_floatConverter,&(pcmAudioBufferList),_floatBuffers,frameCount);
+            
+            if ([self.delegate respondsToSelector:@selector(plotGraphWithBuffer:andLength:)]) {
+                [self.delegate plotGraphWithBuffer:*(_floatBuffers) andLength:frameCount];
+            }
+            
+//			SInt16* samples16 = (SInt16*)frames;
+//			SInt32* samples32 = (SInt32*)frames;
+//			UInt32 countLeft = 0;
+//			UInt32 countRight = 0;
+//			Float32 decibelsLeft = STK_DBMIN;
+//			Float32 peakValueLeft = STK_DBMIN;
+//			Float64 totalValueLeft = 0;
+//			Float32 previousFilteredValueOfSampleAmplitudeLeft = 0;
+//			Float32 decibelsRight = STK_DBMIN;
+//			Float32 peakValueRight = STK_DBMIN;
+//			Float64 totalValueRight = 0;
+//			Float32 previousFilteredValueOfSampleAmplitudeRight = 0;
+//			
+//			if (bytesPerFrame / channelsPerFrame == 2)
+//			{
+//				for (int i = 0; i < frameCount * channelsPerFrame; i += channelsPerFrame)
+//				{
+//					Float32 absoluteValueOfSampleAmplitudeLeft = abs(samples16[i]);
+//					Float32 absoluteValueOfSampleAmplitudeRight = abs(samples16[i + 1]);
+//					
+//					CALCULATE_METER(Left);
+//					CALCULATE_METER(Right);
+//				}
+//			}
+//			else if (bytesPerFrame / channelsPerFrame == 4)
+//			{
+//				for (int i = 0; i < frameCount * channelsPerFrame; i += channelsPerFrame)
+//				{
+//					Float32 absoluteValueOfSampleAmplitudeLeft = abs(samples32[i]) / 32768.0;
+//					Float32 absoluteValueOfSampleAmplitudeRight = abs(samples32[i + 1]) / 32768.0;
+//					
+//					CALCULATE_METER(Left);
+//					CALCULATE_METER(Right);
+//				}
+//			}
+//			else
+//			{
+//				return;
+//			}
+//			
+//			peakPowerDb[0] = MIN(MAX(decibelsLeft, -60), 0);
+//			peakPowerDb[1] = MIN(MAX(decibelsRight, -60), 0);
+//			
+//			if (countLeft > 0)
+//			{
+//				averagePowerDb[0] = MIN(MAX(totalValueLeft / frameCount, -60), 0);
+//			}
+//			
+//			if (countRight != 0)
+//			{
+//				averagePowerDb[1] = MIN(MAX(totalValueRight / frameCount, -60), 0);
+//			}
 		}];
 	}
 }
