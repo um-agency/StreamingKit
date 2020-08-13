@@ -2538,7 +2538,13 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
         return;
     }
     
-    status = AUGraphStop(audioGraph);
+    if (@available(iOS 14.0, *)) {
+        if (stopReasonIn != STKAudioPlayerStopReasonEof) {
+            status = AUGraphStop(audioGraph);
+        }
+    } else {
+        status = AUGraphStop(audioGraph);
+    }
 	
     if (status)
     {
