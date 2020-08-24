@@ -52,6 +52,12 @@
     BOOL iceHeaderAvailable;
     BOOL httpHeaderNotAvailable;
 
+    NSMutableData *_metadataData;
+    int            _metadataOffset;
+    int            _metadataBytesRead;
+    int            _metadataStep;
+    int            _metadataLength;
+    
     NSURL* currentUrl;
     STKAsyncURLProvider asyncUrlProvider;
     NSDictionary* httpHeaders;
@@ -66,6 +72,7 @@
 
 -(instancetype) initWithURL:(NSURL*)urlIn
 {
+    currentUrl = urlIn;
     return [self initWithURLProvider:^NSURL* { return urlIn; }];
 }
 
@@ -311,9 +318,17 @@
         self->iceHeaderData = nil;
     }
     
+    // check ICY headers
+    if ([httpHeaders objectForKey:@"Icy-metaint"] != nil)
+    {
+        _metadataBytesRead  = 0;
+        _metadataStep       = [[httpHeaders objectForKey:@"Icy-metaint"] intValue];
+        _metadataOffset     = _metadataStep;
+    }
+
     if (([httpHeaders objectForKey:@"Accept-Ranges"] ?: [httpHeaders objectForKey:@"accept-ranges"]) != nil)
     {
-        self->supportsSeek = YES;
+        self->supportsSeek = ![[httpHeaders objectForKey:@"Accept-Ranges"] isEqualToString:@"none"];
     }
     
     if (self.httpStatusCode == 200)
@@ -443,6 +458,7 @@
     return [self privateReadIntoBuffer:buffer withSize:size];
 }
 
+#pragma mark - Custom buffer reading
 -(int) privateReadIntoBuffer:(UInt8*)buffer withSize:(int)size
 {
     if (size == 0)
@@ -466,12 +482,90 @@
         return count;
     }
     
-    int read = [super readIntoBuffer:buffer withSize:size];
+    int read;
+    
+    // read ICY stream metadata
+    // http://www.smackfu.com/stuff/programming/shoutcast.html
+    //
+    if(_metadataStep > 0)
+    {
+        // read audio stream before next metadata chunk
+        if(_metadataOffset > 0)
+        {
+            read = [super readIntoBuffer:buffer withSize:MIN(_metadataOffset, size)];
+            if(read > 0)
+                _metadataOffset -= read;
+        }
+        // read metadata
+        else
+        {
+            // first we need to read one byte with length
+            if(_metadataLength == 0)
+            {
+                // read only 1 byte
+                UInt8 metadataLengthByte;
+                read = [super readIntoBuffer:&metadataLengthByte withSize:1];
+                
+                if(read > 0)
+                {
+                    _metadataLength = metadataLengthByte * 16;
+                    
+                    // prepare
+                    if(_metadataLength > 0)
+                    {
+                        _metadataData       = [NSMutableData dataWithLength:_metadataLength];
+                        _metadataBytesRead  = 0;
+                    }
+                    // reset
+                    else
+                    {
+                        _metadataOffset = _metadataStep;
+                        _metadataData   = nil;
+                        _metadataLength = 0;
+                    }
+                    
+                    // return 0, because no audio bytes read
+                    relativePosition += read;
+                    read = 0;
+                }
+            }
+            // read metadata bytes
+            else
+            {
+                read = [super readIntoBuffer:(_metadataData.mutableBytes + _metadataBytesRead)
+                                    withSize:_metadataLength - _metadataBytesRead];
+                
+                if(read > 0)
+                {
+                    _metadataBytesRead += read;
+                    
+                    // done reading, so process it
+                    if(_metadataBytesRead == _metadataLength)
+                    {
+                        if([self.delegate respondsToSelector:@selector(dataSource:didReadStreamMetadata:)])
+                            [self.delegate dataSource:self didReadStreamMetadata:[self _processIcyMetadata:_metadataData]];
+                        
+                        // reset
+                        _metadataData       = nil;
+                        _metadataOffset     = _metadataStep;
+                        _metadataLength     = 0;
+                        _metadataBytesRead  = 0;
+                    }
+
+                    // return 0, because no audio bytes read
+                    relativePosition += read;
+                    read = 0;
+                }
+            }
+        }
+    }
+    else
+    {
+        read = [super readIntoBuffer:buffer withSize:size];
+    }
     
     if (read < 0)
-    {
         return read;
-    }
     
     relativePosition += read;
     
@@ -506,11 +600,11 @@
 
         CFHTTPMessageRef message = CFHTTPMessageCreateRequest(NULL, (CFStringRef)@"GET", (__bridge CFURLRef)self->currentUrl, kCFHTTPVersion1_1);
 
-        if (seekStart > 0 && supportsSeek)
+        if (self->seekStart > 0 && self->supportsSeek)
         {
-            CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Range"), (__bridge CFStringRef)[NSString stringWithFormat:@"bytes=%lld-", seekStart]);
+            CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Range"), (__bridge CFStringRef)[NSString stringWithFormat:@"bytes=%lld-", self->seekStart]);
 
-            discontinuous = YES;
+            self->discontinuous = YES;
         }
 
         for (NSString* key in self->requestHeaders)
@@ -521,11 +615,11 @@
         }
         
         CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Accept"), CFSTR("*/*"));
-        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Ice-MetaData"), CFSTR("0"));
+        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Icy-MetaData"), CFSTR("1"));
 
-        stream = CFReadStreamCreateForHTTPRequest(NULL, message);
-
-        if (stream == nil)
+        self->stream = CFReadStreamCreateForHTTPRequest(NULL, message);
+        
+        if (self->stream == nil)
         {
             CFRelease(message);
 
@@ -534,9 +628,9 @@
             return;
         }
  
-        CFReadStreamSetProperty(stream, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground);
+        CFReadStreamSetProperty(self->stream, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground);
 
-        if (!CFReadStreamSetProperty(stream, kCFStreamPropertyHTTPShouldAutoredirect, kCFBooleanTrue))
+        if (!CFReadStreamSetProperty(self->stream, kCFStreamPropertyHTTPShouldAutoredirect, kCFBooleanTrue))
         {
             CFRelease(message);
 
@@ -547,19 +641,17 @@
 
         // Proxy support
         CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
-        CFReadStreamSetProperty(stream, kCFStreamPropertyHTTPProxy, proxySettings);
+        CFReadStreamSetProperty(self->stream, kCFStreamPropertyHTTPProxy, proxySettings);
         CFRelease(proxySettings);
 
         // SSL support
         if ([self->currentUrl.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame)
         {
             NSDictionary* sslSettings = [NSDictionary dictionaryWithObjectsAndKeys:
-            (NSString*)kCFStreamSocketSecurityLevelNegotiatedSSL, kCFStreamSSLLevel,
-            [NSNumber numberWithBool:NO], kCFStreamSSLValidatesCertificateChain,
-            [NSNull null], kCFStreamSSLPeerName,
-            nil];
-
-            CFReadStreamSetProperty(stream, kCFStreamPropertySSLSettings, (__bridge CFTypeRef)sslSettings);
+                                         (NSString*)kCFStreamSocketSecurityLevelNegotiatedSSL, kCFStreamSSLLevel,
+                                         [NSNumber numberWithBool:NO], kCFStreamSSLValidatesCertificateChain,
+                                         nil];
+            CFReadStreamSetProperty(self->stream, kCFStreamPropertySSLSettings, (__bridge CFTypeRef)sslSettings);
         }
 
         [self reregisterForEvents];
@@ -567,12 +659,12 @@
 		self->httpStatusCode = 0;
 		
         // Open
-        if (!CFReadStreamOpen(stream))
+        if (!CFReadStreamOpen(self->stream))
         {
-            CFRelease(stream);
+            CFRelease(self->stream);
             CFRelease(message);
             
-            stream = 0;
+            self->stream = NULL;
 
             [self errorOccured];
 
@@ -603,6 +695,29 @@
 -(BOOL) supportsSeek
 {
     return self->supportsSeek;
+}
+
+#pragma mark - Private
+
+- (NSDictionary*)_processIcyMetadata:(NSData*)data
+{
+    NSMutableDictionary *metadata       = [NSMutableDictionary new];
+    NSString            *metadataString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    NSArray             *pairs          = [metadataString componentsSeparatedByString:@";"];
+    
+    for(NSString *pair in pairs)
+    {
+        NSArray *components = [pair componentsSeparatedByString:@"="];
+        if(components.count < 2)
+            continue;
+        
+        NSString *key   = components[0];
+        NSString *value = [pair substringWithRange:NSMakeRange(key.length + 2, pair.length - (key.length + 2) - 1)];
+        
+        [metadata setValue:value forKey:key];
+    }
+    
+    return metadata;
 }
 
 @end

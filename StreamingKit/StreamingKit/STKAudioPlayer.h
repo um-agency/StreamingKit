@@ -107,7 +107,7 @@ STKAudioPlayerOptions;
 
 #define STK_DISABLE_BUFFER (0xffffffff)
 
-typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, float* frames);
+typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames);
 
 @interface STKFrameFilterEntry : NSObject
 @property (readonly) NSString* name;
@@ -137,6 +137,9 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 
 -(void) plotGraphWithBuffer:(float*)buffer andLength:(UInt32)count;
 
+/// Raised when datasource read stream metadata. Called from the non-main thread.
+-(void) audioPlayer:(STKAudioPlayer*)audioPlayer didReadStreamMetadata:(NSDictionary*)dictionary;
+
 @end
 
 @interface STKAudioPlayer : NSObject<STKDataSourceDelegate>
@@ -150,6 +153,10 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 @property (readonly) double duration;
 /// Gets the current item progress in seconds
 @property (readonly) double progress;
+/// Gets or sets the playback rate (default is 1.0)
+@property(readwrite) float rate;
+// Gets or sets the playback overlap (default is 8.0)
+@property(readwrite) float overlap;
 /// Enables or disables peak and average decibel meteting
 @property (readwrite) BOOL meteringEnabled;
 /// Enables or disables the EQ
@@ -169,13 +176,16 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 /// Gets the reason why the player is stopped (if any)
 @property (readonly) STKAudioPlayerStopReason stopReason;
 /// Gets and sets the delegate used for receiving events from the STKAudioPlayer
-@property (readwrite, unsafe_unretained) id<STKAudioPlayerDelegate> delegate;
+@property (readwrite, weak) id<STKAudioPlayerDelegate> delegate;
 
 /// Creates a datasource from a given URL.
 /// URLs with FILE schemes will return an STKLocalFileDataSource.
 /// URLs with HTTP schemes will return an STKHTTPDataSource wrapped within an STKAutoRecoveringHTTPDataSource.
 /// URLs with unrecognised schemes will return nil.
 +(STKDataSource*) dataSourceFromURL:(NSURL*)url;
+
+/// Returns canonical audio format used by STKFrameFilter blocks.
++(AudioStreamBasicDescription)canonicalAudioStreamBasicDescription;
 
 /// Initializes a new STKAudioPlayer with the default options
 -(instancetype) init;
@@ -262,11 +272,11 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 
 /// Reads the peak power in decibals for the given channel (0 or 1).
 /// Return values are between -60 (low) and 0 (high).
-//-(float) peakPowerInDecibelsForChannel:(NSUInteger)channelNumber;
+-(float) peakPowerInDecibelsForChannel:(NSUInteger)channelNumber;
 
 /// Reads the average power in decibals for the given channel (0 or 1)
 /// Return values are between -60 (low) and 0 (high).
-//-(float) averagePowerInDecibelsForChannel:(NSUInteger)channelNumber;
+-(float) averagePowerInDecibelsForChannel:(NSUInteger)channelNumber;
 
 /// Sets the gain value (from -96 low to +24 high) for an equalizer band (0 based index)
 -(void) setGain:(float)gain forEqualizerBand:(int)bandIndex;
